@@ -1,173 +1,85 @@
-import os
-import io
-import json
-
-import PyPDF2
-import docx2txt
+import gradio as gr
 import openai
+import cv2
+import base64
+from PIL import Image
+import io
+import tempfile
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-
-app = FastAPI(title="NexusAI Resume Parser")
-
-# ───────────────────────────────────────────
-# HARDCODED CREDENTIALS
-# ───────────────────────────────────────────
-API_KEY  = os.getenv("API_KEY")
-BASE_URL = os.getenv("NAVIGATE_BASE_URL")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+client = openai.OpenAI(
+    api_key="API_KEY",
+    base_url="BASE_URL"
 )
 
-# ───────────────────────────────────────────
-# TEXT EXTRACTION
-# ───────────────────────────────────────────
-def extract_text(content: bytes, filename: str) -> str:
-    fname = filename.lower()
+def summarize_video(video):
 
-    if fname.endswith(".pdf"):
-        reader = PyPDF2.PdfReader(io.BytesIO(content))
-        return "\n".join(p.extract_text() or "" for p in reader.pages).strip()
+    FRAME_INTERVAL = 1
 
-    elif fname.endswith(".docx") or fname.endswith(".doc"):
-        import tempfile, shutil
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
-        tmp.write(content); tmp.close()
-        try:
-            return docx2txt.process(tmp.name).strip()
-        finally:
-            os.unlink(tmp.name)
+    cap = cv2.VideoCapture(video)
 
-    elif fname.endswith(".txt"):
-        return content.decode("utf-8", errors="ignore").strip()
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_interval = int(fps * FRAME_INTERVAL)
 
-    raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF, DOCX, or TXT.")
+    frames_base64 = []
 
+    frame_count = 0
 
-# ───────────────────────────────────────────
-# SYSTEM PROMPT  (same structure as your original)
-# ───────────────────────────────────────────
-SYSTEM_PROMPT = """
-You are an expert AI resume parser. Extract information from the resume text and return ONLY a valid JSON object.
-Do NOT include markdown blocks like ```json or any conversational text. Just output raw JSON.
+    while True:
+        success, frame = cap.read()
 
-The JSON MUST strictly follow this structure:
-{
-  "personalInfo": {
-    "name": "",
-    "email": "",
-    "phone": "",
-    "location": "",
-    "linkedIn": ""
-  },
-  "summary": "",
-  "skills": ["skill1", "skill2"],
-  "experience": [
-    {
-      "title": "",
-      "company": "",
-      "duration": "",
-      "description": ""
-    }
-  ],
-  "education": [
-    {
-      "degree": "",
-      "institution": "",
-      "year": ""
-    }
-  ]
-}
-"""
+        if not success:
+            break
 
-# ───────────────────────────────────────────
-# HEALTH CHECK
-# ───────────────────────────────────────────
-@app.get("/health")
-def health():
-    return {"message": "NexusAI Resume Parser Backend is running ✅"}
+        if frame_count % frame_interval == 0:
 
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-# ───────────────────────────────────────────
-# PARSE ENDPOINT  — matches your original /api/parse
-# ───────────────────────────────────────────
-@app.post("/api/parse")
-async def parse_resume(
-    resume: UploadFile = File(...),
-):
-    # Read file
-    content = await resume.read()
-    if not content:
-        return {"success": False, "error": "Empty file received."}
+            img = Image.fromarray(frame_rgb)
 
-    # Extract text
-    try:
-        text = extract_text(content, resume.filename or "resume.pdf")
-    except HTTPException as e:
-        return {"success": False, "error": e.detail}
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=70)
 
-    if not text:
-        return {"success": False, "error": "Could not extract text. File may be image-based or corrupted."}
-    if len(text) < 50:
-        return {"success": False, "error": "Extracted text is too short. File may be invalid."}
+            img_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-    # Call LLM
-    try:
-        client = openai.OpenAI(
-            api_key=API_KEY,
-            base_url=BASE_URL,
-        )
-        response = client.chat.completions.create(
-            model="gemini-2.5-flash",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": text[:6000]},
-            ],
-            max_tokens=2000,
-            temperature=0,
-        )
-    except openai.AuthenticationError:
-        return {"success": False, "error": "Invalid API key."}
-    except openai.RateLimitError:
-        return {"success": False, "error": "Rate limit hit. Please try again shortly."}
-    except Exception as e:
-        return {"success": False, "error": f"LLM error: {str(e)}"}
+            frames_base64.append(img_b64)
 
-    # Clean & parse JSON
-    raw = response.choices[0].message.content.strip()
-    if raw.startswith("```json"): raw = raw[7:]
-    if raw.startswith("```"):     raw = raw[3:]
-    if raw.endswith("```"):       raw = raw[:-3]
-    raw = raw.strip()
+        frame_count += 1
 
-    try:
-        parsed_data = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"success": False, "error": "The AI model failed to return valid JSON."}
+    cap.release()
 
-    return {"success": True, "data": parsed_data}
+    content = [
+        {
+            "type": "text",
+            "text": "These are frames extracted from a video. Summarize the full video in detail."
+        }
+    ]
 
+    for frame in frames_base64[:20]:
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{frame}"
+            }
+        })
 
-# ───────────────────────────────────────────
-# FRONTEND  — served at /
-# ───────────────────────────────────────────
-@app.get("/", response_class=HTMLResponse)
-def frontend():
-    html_path = os.path.join(os.path.dirname(__file__), "index.html")
-    with open(html_path) as f:
-        return HTMLResponse(content=f.read())
+    response = client.chat.completions.create(
+        model="gemini-2.5-flash",
+        messages=[
+            {
+                "role": "user",
+                "content": content
+            }
+        ],
+        max_tokens=2000
+    )
 
+    return response.choices[0].message.content
 
-# ───────────────────────────────────────────
-# ENTRY POINT
-# ───────────────────────────────────────────
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+demo = gr.Interface(
+    fn=summarize_video,
+    inputs=gr.Video(),
+    outputs="text",
+    title="AI Video Summarizer"
+)
+
+demo.launch()
